@@ -42,6 +42,23 @@ export async function getFFmpeg(onProgress?: LoadProgress): Promise<FFmpeg> {
   }
 }
 
+/**
+ * There is exactly one ffmpeg instance and it is single-threaded, so two jobs
+ * must never overlap — the GIF and MP3 exports would clobber each other's files
+ * in the virtual FS and interleave their `progress` events. Every job runs
+ * through this queue.
+ *
+ * Only leaf jobs (encodeGif, encodeMp3) take the lock. Anything that composes
+ * them — encodeToFit, for instance — must NOT, or it deadlocks itself.
+ */
+let queue: Promise<unknown> = Promise.resolve();
+
+export function withFFmpegLock<T>(job: () => Promise<T>): Promise<T> {
+  const run = queue.then(job, job);
+  queue = run.catch(() => {});
+  return run;
+}
+
 export type Crop = { x: number; y: number; w: number; h: number };
 
 export type EncodeOptions = {
@@ -153,7 +170,15 @@ export function countGifFrames(buf: Uint8Array): number {
   }
 }
 
-export async function encodeGif(
+export function encodeGif(
+  source: Uint8Array,
+  o: EncodeOptions,
+  onProgress?: (pct: number) => void,
+): Promise<EncodeResult> {
+  return withFFmpegLock(() => runGifEncode(source, o, onProgress));
+}
+
+async function runGifEncode(
   source: Uint8Array,
   o: EncodeOptions,
   onProgress?: (pct: number) => void,

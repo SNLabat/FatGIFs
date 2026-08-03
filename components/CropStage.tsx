@@ -11,6 +11,8 @@ type Props = {
   naturalHeight: number;
   crop: Crop;
   aspect: number | null; // width / height, null = free
+  muted: boolean;
+  volume: number; // 0-1
   onCrop: (c: Crop) => void;
   onLoadedMetadata: () => void;
   onTimeUpdate: () => void;
@@ -27,6 +29,8 @@ export default function CropStage({
   naturalHeight,
   crop,
   aspect,
+  muted,
+  volume,
   onCrop,
   onLoadedMetadata,
   onTimeUpdate,
@@ -34,6 +38,15 @@ export default function CropStage({
   const boxRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
   const drag = useRef<{ mode: Mode; px: number; py: number; start: Crop } | null>(null);
+
+  // React is unreliable about reflecting `muted` as a DOM property once the
+  // element exists, so drive both of these off the ref instead of JSX props.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = muted;
+    v.volume = Math.max(0, Math.min(1, volume));
+  }, [videoRef, muted, volume]);
 
   // Keep the display-to-source scale factor in sync with layout.
   useEffect(() => {
@@ -147,7 +160,6 @@ export default function CropStage({
         ref={videoRef}
         src={src}
         playsInline
-        muted
         preload="auto"
         onLoadedMetadata={onLoadedMetadata}
         onTimeUpdate={onTimeUpdate}

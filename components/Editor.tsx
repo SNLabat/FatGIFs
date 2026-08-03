@@ -3,8 +3,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import CropStage, { type Crop } from './CropStage';
 import Timeline from './Timeline';
+import AudioBar from './AudioBar';
 import { LIMITS, MAX_MB, formatBytes, formatTime } from '@/lib/limits';
 import { encodeGif, encodeToFit, estimateFrames, getFFmpeg, type EncodeOptions, type EncodeResult } from '@/lib/ffmpeg';
+import {
+  MP3_BITRATES,
+  audioDuration,
+  encodeMp3,
+  probeHasAudio,
+  type AudioEncodeOptions,
+  type AudioResult,
+} from '@/lib/audio';
 import type { ClipInfo } from '@/lib/twitch';
 
 type Phase = 'idle' | 'resolving' | 'downloading' | 'ready' | 'error';
@@ -71,6 +80,24 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
   const [encStep, setEncStep] = useState('');
   const [result, setResult] = useState<EncodeResult | null>(null);
   const [resultUrl, setResultUrl] = useState('');
+
+  /* -------------------------------- audio -------------------------------- */
+  // Starts muted: browsers block unmuted autoplay, and nobody wants a clip
+  // blasting the moment the editor opens.
+  const [muted, setMuted] = useState(true);
+  const [volume, setVolume] = useState(0.8);
+  const [hasAudio, setHasAudio] = useState<boolean | null>(null);
+
+  const [mp3Bitrate, setMp3Bitrate] = useState(192);
+  const [matchSpeed, setMatchSpeed] = useState(true);
+  const [audioFade, setAudioFade] = useState(true);
+  const [audioNormalize, setAudioNormalize] = useState(false);
+
+  const [audioEncoding, setAudioEncoding] = useState(false);
+  const [audioPct, setAudioPct] = useState(0);
+  const [audioError, setAudioError] = useState('');
+  const [audioResult, setAudioResult] = useState<AudioResult | null>(null);
+  const [audioUrl, setAudioUrl] = useState('');
 
   /* ----------------------------- source loading -------------------------- */
 
@@ -167,6 +194,18 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A new source invalidates any previously extracted audio, and tells us up
+  // front whether there's an audio track worth offering at all.
+  useEffect(() => {
+    setAudioResult(null);
+    setAudioError('');
+    setAudioUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return '';
+    });
+    setHasAudio(srcBytes ? probeHasAudio(srcBytes) : null);
+  }, [srcBytes]);
+
   // Warm the encoder in the background so the first export isn't a cold start.
   useEffect(() => {
     let alive = true;
@@ -232,7 +271,14 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
     if (!v) return;
     if (v.paused) {
       if (v.currentTime < start || v.currentTime > end) v.currentTime = start;
-      v.play();
+      v.play().catch(() => {
+        // Some browsers still refuse unmuted playback in edge cases (autoplay
+        // policy, no prior gesture on this document). Fall back to silent
+        // playback rather than leaving the user with a dead play button.
+        v.muted = true;
+        setMuted(true);
+        v.play().catch(() => setPlaying(false));
+      });
       setPlaying(true);
     } else {
       v.pause();
@@ -262,11 +308,15 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
         setStart(Math.min(current, end - 0.05));
       } else if (e.key === 'o' || e.key === 'O') {
         setEnd(Math.max(current, start + 0.05));
+      } else if (e.key === 'm' || e.key === 'M') {
+        if (hasAudio === false) return;
+        setVolume((v) => (muted && v === 0 ? 0.8 : v));
+        setMuted((m) => !m);
       }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [phase, current, fps, start, end, seek]);
+  }, [phase, current, fps, start, end, seek, muted, hasAudio]);
 
   /* -------------------------------- derived ------------------------------ */
 
@@ -311,6 +361,31 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
       sharpen,
     }),
     [start, end, crop, out, fps, speed, colors, dither, bayerScale, loop, direction, sharpen],
+  );
+
+  const audioOptions: AudioEncodeOptions = useMemo(
+    () => ({
+      start,
+      end,
+      bitrate: mp3Bitrate,
+      // Direction is deliberately ignored: a boomerang GIF still gets forward
+      // audio, which is what people actually want out of a sound clip.
+      speed: matchSpeed ? speed : 1,
+      fade: audioFade,
+      normalize: audioNormalize,
+    }),
+    [start, end, mp3Bitrate, matchSpeed, speed, audioFade, audioNormalize],
+  );
+
+  const audioSeconds = audioDuration(audioOptions);
+  const audioStale = Boolean(
+    audioResult &&
+      (audioResult.options.start !== start ||
+        audioResult.options.end !== end ||
+        audioResult.options.bitrate !== mp3Bitrate ||
+        audioResult.options.speed !== audioOptions.speed ||
+        audioResult.options.fade !== audioFade ||
+        audioResult.options.normalize !== audioNormalize),
   );
 
   const plannedFrames = estimateFrames(options);
@@ -358,15 +433,49 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
     }
   }
 
-  function download() {
-    if (!resultUrl || !result) return;
-    const base = (emoteName || clip?.slug || 'emote').replace(/[^A-Za-z0-9_-]/g, '') || 'emote';
+  async function runAudioEncode() {
+    if (!srcBytes) return;
+    setAudioEncoding(true);
+    setAudioPct(0);
+    setAudioError('');
+    try {
+      const res = await encodeMp3(srcBytes, audioOptions, setAudioPct);
+      setAudioResult(res);
+      setAudioUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(new Blob([res.data as unknown as BlobPart], { type: 'audio/mpeg' }));
+      });
+      // The probe can only speak for MP4 containers; a successful export is
+      // proof enough for everything else.
+      setHasAudio(true);
+    } catch (err) {
+      setAudioError((err as Error).message);
+    } finally {
+      setAudioEncoding(false);
+    }
+  }
+
+  function baseName() {
+    return (emoteName || clip?.slug || 'emote').replace(/[^A-Za-z0-9_-]/g, '') || 'emote';
+  }
+
+  function saveAs(url: string, filename: string) {
     const a = document.createElement('a');
-    a.href = resultUrl;
-    a.download = `${base}_${result.width}x${result.height}.gif`;
+    a.href = url;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
+  }
+
+  function download() {
+    if (!resultUrl || !result) return;
+    saveAs(resultUrl, `${baseName()}_${result.width}x${result.height}.gif`);
+  }
+
+  function downloadAudio() {
+    if (!audioUrl || !audioResult) return;
+    saveAs(audioUrl, `${baseName()}_${audioResult.seconds.toFixed(1)}s.mp3`);
   }
 
   /* --------------------------------- render ------------------------------ */
@@ -456,9 +565,19 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
           naturalHeight={nat.h}
           crop={crop}
           aspect={aspect}
+          muted={muted || hasAudio === false}
+          volume={volume}
           onCrop={setCrop}
           onLoadedMetadata={onLoadedMetadata}
           onTimeUpdate={onTimeUpdate}
+        />
+
+        <AudioBar
+          muted={muted}
+          volume={volume}
+          hasAudio={hasAudio}
+          onMuted={setMuted}
+          onVolume={setVolume}
         />
 
         <Timeline
@@ -486,6 +605,7 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
           <span className="mono faint" style={{ marginLeft: 6 }}>
             {formatTime(current)} / {formatTime(duration)}
           </span>
+
           <span className="spacer" style={{ flex: 1 }} />
           <span className="mono" style={{ color: 'var(--accent-hot)' }}>
             {trimSeconds.toFixed(2)}s selected
@@ -520,7 +640,7 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
         <p className="small faint" style={{ margin: 0 }}>
           <span className="kbd">Space</span> play · <span className="kbd">←</span>/<span className="kbd">→</span> step a
           frame · <span className="kbd">Shift</span>+arrows one second · <span className="kbd">I</span>/
-          <span className="kbd">O</span> set in / out
+          <span className="kbd">O</span> set in / out · <span className="kbd">M</span> mute
         </p>
       </main>
 
@@ -580,12 +700,16 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
             </>
           ) : (
             <div className="stack">
-              <button className="btn primary block" disabled={!engineReady || !framesOk} onClick={() => runEncode(false)}>
+              <button
+                className="btn primary block"
+                disabled={!engineReady || !framesOk || audioEncoding}
+                onClick={() => runEncode(false)}
+              >
                 {engineReady ? 'Encode GIF' : 'Loading encoder…'}
               </button>
               <button
                 className="btn block"
-                disabled={!engineReady || !framesOk}
+                disabled={!engineReady || !framesOk || audioEncoding}
                 onClick={() => runEncode(true)}
                 title="Encodes repeatedly, backing off palette then frame rate then size until it fits"
               >
@@ -627,6 +751,118 @@ export default function Editor({ initialSlug, initialName }: { initialSlug: stri
                 </button>
               </div>
             </>
+          )}
+        </div>
+
+        {/* ------------------------------- audio --------------------------- */}
+        <div className="card">
+          <div className="card-head">
+            <h3>Audio</h3>
+            <span className="spacer" />
+            <span className="mono faint">{audioSeconds.toFixed(2)}s</span>
+          </div>
+
+          {hasAudio === false ? (
+            <div className="notice small">
+              This clip has no audio track, so there's nothing to extract. Twitch clips captured from a silent source
+              (or some re-uploads) come through video-only.
+            </div>
+          ) : (
+            <div className="stack">
+              <p className="small faint" style={{ margin: 0 }}>
+                Extracts the same in/out selection as the GIF, straight from the source in your browser.
+              </p>
+
+              <label className="field">
+                Bitrate
+                <div className="seg" style={{ alignSelf: 'flex-start', flexWrap: 'wrap' }}>
+                  {MP3_BITRATES.map((b) => (
+                    <button key={b} aria-pressed={mp3Bitrate === b} onClick={() => setMp3Bitrate(b)}>
+                      {b}k
+                    </button>
+                  ))}
+                </div>
+              </label>
+
+              <div className="row row-wrap" style={{ gap: 16 }}>
+                <label className="row small" style={{ gap: 6, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={matchSpeed}
+                    onChange={(e) => setMatchSpeed(e.target.checked)}
+                    style={{ width: 'auto' }}
+                  />
+                  Match GIF speed
+                </label>
+                <label className="row small" style={{ gap: 6, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={audioFade}
+                    onChange={(e) => setAudioFade(e.target.checked)}
+                    style={{ width: 'auto' }}
+                  />
+                  Fade edges
+                </label>
+                <label className="row small" style={{ gap: 6, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={audioNormalize}
+                    onChange={(e) => setAudioNormalize(e.target.checked)}
+                    style={{ width: 'auto' }}
+                  />
+                  Normalize loudness
+                </label>
+              </div>
+
+              {matchSpeed && speed !== 1 && (
+                <div className="notice small">
+                  Audio is pitch-corrected to {speed.toFixed(2)}× via <span className="mono">atempo</span>. Direction is
+                  never applied — a boomerang GIF still gets forward audio.
+                </div>
+              )}
+
+              {audioEncoding ? (
+                <>
+                  <div className="row small muted">
+                    <span className="spinner" /> Extracting audio… {audioPct}%
+                  </div>
+                  <div className="meter">
+                    <div style={{ width: `${audioPct}%` }} />
+                  </div>
+                </>
+              ) : (
+                <button
+                  className="btn block"
+                  disabled={!engineReady || audioSeconds <= 0 || encoding}
+                  onClick={runAudioEncode}
+                >
+                  {engineReady ? (audioResult ? 'Re-extract MP3' : 'Extract MP3') : 'Loading encoder…'}
+                </button>
+              )}
+
+              {audioError && <div className="notice error small">{audioError}</div>}
+
+              {audioResult && (
+                <>
+                  <div className="divider" />
+                  <audio className="audio-preview" src={audioUrl} controls preload="metadata" />
+                  <div className="row small muted">
+                    <span className="mono">
+                      {audioResult.seconds.toFixed(2)}s · {audioResult.options.bitrate} kbps ·{' '}
+                      {formatBytes(audioResult.bytes)}
+                    </span>
+                  </div>
+                  {audioStale && (
+                    <div className="notice warn small">
+                      Settings changed since this was extracted. Re-extract to pick them up.
+                    </div>
+                  )}
+                  <button className="btn primary block" onClick={downloadAudio}>
+                    Download MP3
+                  </button>
+                </>
+              )}
+            </div>
           )}
         </div>
 
